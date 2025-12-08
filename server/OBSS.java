@@ -6,7 +6,7 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 
-public class BlockStorageServer {
+public class OBSS {
     private static final int PORT = 5000;
     private static final String BLOCK_DIR = "server/blockstorage";
     private static final String META_FILE = "metadata.ser";

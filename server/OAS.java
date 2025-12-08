@@ -1,14 +1,21 @@
 import java.io.*;
 import java.net.*;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.*;
 
 public class OAS {
 
     private static final int PORT = 6000;
     private static Map<String, User> users = new HashMap<>();
+    private static Map<String, String> pendingNonces = new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws IOException {
         ServerSocket serverSocket = new ServerSocket(PORT);
@@ -25,10 +32,9 @@ public class OAS {
     private static void handleClient(Socket socket) {
         try (
                 DataInputStream in = new DataInputStream(socket.getInputStream());
-                DataOutputStream out = new DataOutputStream(socket.getOutputStream())
-        ) {
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             while (true) {
-                String cmd = in.readUTF(); 
+                String cmd = in.readUTF();
 
                 switch (cmd) {
                     case "CREATE_REG":
@@ -66,54 +72,170 @@ public class OAS {
     }
 
     private static void CreateRegistration(DataInputStream in, DataOutputStream out) throws IOException {
-        //read pubkey, salt, password hash, metadata
         try {
-        String pubKeyB64 = in.readUTF();
-        byte[] salt = Base64.getDecoder().decode(in.readUTF());
-        byte[] pwHash = Base64.getDecoder().decode(in.readUTF());
+            String pubKeyB64 = in.readUTF();
+            byte[] salt = Base64.getDecoder().decode(in.readUTF());
+            byte[] pwHash = Base64.getDecoder().decode(in.readUTF());
 
-        int attrCount = in.readInt();
-        Map<String, String> attrs = new HashMap<>();
-        for (int i = 0; i < attrCount; i++) {
-            String key = in.readUTF();
-            String value = in.readUTF();
-            attrs.put(key, value);
+            int attrCount = in.readInt();
+            Map<String, String> attrs = new HashMap<>();
+            for (int i = 0; i < attrCount; i++) {
+                String key = in.readUTF();
+                String value = in.readUTF();
+                attrs.put(key, value);
+            }
+
+            String anonId = convertId(pubKeyB64);
+            User u = new User(pubKeyB64, pwHash, salt, attrs);
+            users.put(anonId, u);
+
+            out.writeUTF("OK_CREATE_REG");
+            out.flush();
+        } catch (Exception e) {
+            out.writeUTF("ERROR_CREATE_REG");
+            out.flush();
         }
-
-        User u = new User(pubKeyB64, pwHash, salt, attrs);
-        users.put(pubKeyB64, u);
-
-        out.writeUTF("OK_CREATE_REG");
-        out.flush();
-    } catch (Exception e) {
-        out.writeUTF("ERROR_CREATE_REG");
-        out.flush();
-    }
     }
 
     private static void ModifyRegistration(DataInputStream in, DataOutputStream out) throws IOException {
-        //Allows users to modify attributes previously registered by the respective user
+        // Allows users to modify attributes previously registered by the respective
+        // user
         out.writeUTF("OK_MODIFY_REG");
         out.flush();
     }
 
     private static void AuthStart(DataInputStream in, DataOutputStream out) throws IOException {
-        // TODO: read username, send nonce
-        out.writeUTF("NONCE_PLACEHOLDER");
-        out.writeLong(System.currentTimeMillis());
+        String pubKeyB64 = in.readUTF();
+        String anonId = convertId(pubKeyB64);
+
+        if (!users.containsKey(anonId)) {
+            out.writeUTF("ERROR_NO_SUCH_USER");
+            return;
+        }
+
+        String nonce = UUID.randomUUID().toString();
+        long timeStamp = System.currentTimeMillis();
+
+        pendingNonces.put(nonce, anonId + "|" + timeStamp);
+
+        out.writeUTF(nonce);
+        out.writeLong(timeStamp);
         out.flush();
     }
 
     private static void AuthResponse(DataInputStream in, DataOutputStream out) throws IOException {
-        // TODO: verificar assinatura
-        out.writeUTF("TOKEN");
-        out.writeUTF("FAKE_TOKEN_VALUE");
-        out.flush();
+        try {
+            String pubKeyB64 = in.readUTF();
+            String nonce = in.readUTF();
+            long timeStamp = in.readLong();
+            String signatureB64 = in.readUTF();
+            String pwHash = in.readUTF();
+
+            String anonId = convertId(pubKeyB64);
+
+            User u = users.get(anonId);
+            if (u == null) {
+                out.writeUTF("ERROR_NO_SUCH_USER");
+                pendingNonces.remove(nonce);
+
+                return;
+            }
+
+            String storedNonce = pendingNonces.get(nonce);
+            // check if nonce exists
+            if (!pendingNonces.containsKey(nonce)) {
+                out.writeUTF("ERROR_NONCE_DOES_NOT_EXIST");
+                pendingNonces.remove(nonce);
+                return;
+            }
+
+            String[] attributes = storedNonce.split("\\|");
+            String storedAnonId = attributes[0];
+            long storedTimeStamp = Long.parseLong(attributes[1]);
+
+            // check if correct nonce
+            if (!storedAnonId.equals(anonId)) {
+                out.writeUTF("ERROR_BAD_NONCE");
+                pendingNonces.remove(nonce);
+                return;
+            }
+
+            // check if correct timestamp
+            if (storedTimeStamp != timeStamp) {
+                out.writeUTF("ERROR_BAD_TIMESTAMP");
+                pendingNonces.remove(nonce);
+                return;
+            }
+
+            // check pass hash
+            if (!Base64.getEncoder().encodeToString(u.pwHash).equals(pwHash)) {
+                out.writeUTF("ERROR_BAD_PASSWORD");
+                pendingNonces.remove(nonce);
+                return;
+            }
+
+            // verify signature
+            PublicKey pubKey = loadECPublicKey(pubKeyB64);
+            String msg = nonce + "|" + timeStamp;
+            boolean check = verifySignature(pubKey, msg.getBytes(), Base64.getDecoder().decode(signatureB64));
+            if (!check) {
+                out.writeUTF("ERROR_BAD_SIGNATURE");
+                pendingNonces.remove(nonce);
+                return;
+            }
+
+            String token = generateToken(anonId);
+            out.writeUTF("OK_AUTH");
+            out.writeUTF(token);
+            out.flush();
+
+            pendingNonces.remove(nonce);
+        } catch (Exception e) {
+            out.writeUTF("ERROR_AUTH_EXCEPTION");
+            out.flush();
+        }
+    }
+
+    private static PublicKey loadECPublicKey(String b64) throws Exception {
+        byte[] bytes = Base64.getDecoder().decode(b64);
+        KeyFactory factory = KeyFactory.getInstance("EC");
+        return factory.generatePublic(new X509EncodedKeySpec(bytes));
+    }
+
+    private static boolean verifySignature(PublicKey key, byte[] msg, byte[] signature) {
+        try {
+            Signature sign = Signature.getInstance("SHA256withECDSA");
+            sign.initVerify(key);
+            sign.update(msg);
+            return sign.verify(signature);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String generateToken(String anonId) {
+        long ts = System.currentTimeMillis();
+        return Base64.getEncoder().encodeToString((anonId + "|" + ts).getBytes());
     }
 
     private static void GetUserPubKey(DataInputStream in, DataOutputStream out) throws IOException {
-        // TODO: retornar pub key do user
-        out.writeUTF("PUBKEY_PLACEHOLDER");
+        String anonId = in.readUTF();
+        User u = users.get(anonId);
+        if (u == null) {
+            out.writeUTF("ERROR_NO_SUCH_USER");
+            return;
+        }
+        out.writeUTF(u.pubKeyB64);
         out.flush();
+    }
+
+    private static String convertId(String id) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(id.getBytes());
+            return Base64.getEncoder().encodeToString(hash);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 }

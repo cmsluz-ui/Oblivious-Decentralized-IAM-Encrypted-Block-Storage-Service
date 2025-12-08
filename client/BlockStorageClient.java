@@ -2,43 +2,83 @@
 import encryption.FileDecryption;
 import encryption.FileEncryption;
 import encryption.KeywordSecurity;
+import sessionKeys.ECCKeyManager;
+
 import static encryption.KeywordSecurity.bytesToHex;
 import java.io.*;
 import java.net.*;
+import java.security.KeyPair;
+import java.security.MessageDigest;
 import java.util.*;
 
 import javax.crypto.SecretKey;
 import streamciphers.PBKDF2;
 
 public class BlockStorageClient {
-    private static final int PORT = 5000;
+    private static final int OBSS_PORT = 5000;
+    private static final int OAS_PORT = 6000;
     private static final int BLOCK_SIZE = 4096;
     private static final String INDEX_FILE = "client_index.ser";
+    private static final String SALT_FILE = "client_auth/salt.bin";
 
     private static Map<String, List<String>> fileIndex = new HashMap<>();
-    private static Map<String, String> passwordIndex = new HashMap<>();
 
-    private static FileEncryption encryptor;
-    private static FileDecryption decryptor;
+    private static FileEncryption encryptor = null;
+    private static FileDecryption decryptor = null;
     private static KeywordSecurity kwSec;
+
+    private static KeyPair keyPair;
+    private static String authToken = null;
+
+    private static String clientPassword = null;
 
     public static void main(String[] args) throws IOException, ClassNotFoundException, Exception {
         loadIndex();
 
-        Socket socket = new Socket("localhost", PORT);
+        keyPair = ECCKeyManager.loadKeyPair();
+
+        Socket socket = new Socket("localhost", OBSS_PORT);
         kwSec = new KeywordSecurity();
 
         try (
                 DataInputStream in = new DataInputStream(socket.getInputStream());
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                 Scanner scanner = new Scanner(System.in);) {
-            String password = null;
             while (true) {
-                System.out.print("Command (PUT/GET/LIST/SEARCH/EXIT): ");
+                System.out.print("Command (REGISTER/AUTH/PUT/GET/LIST/SEARCH/EXIT): ");
                 String cmd = scanner.nextLine().toUpperCase();
 
                 switch (cmd) {
+                    case "REGISTER":
+                        System.out.println("Create password: ");
+                        String sessionPassword = scanner.nextLine().trim();
+                        if (sessionPassword.isEmpty()) {
+                            System.out.println("The system requires a password.");
+                            break;
+                        }
+
+                        String result = registerClient(sessionPassword);
+                        System.out.println("OAS replied with " + result);
+                        if (result != null && result.startsWith("OK")) {
+                            clientPassword = sessionPassword;
+                        }
+                        break;
+                    case "AUTH":
+                        System.out.println("Enter your password: ");
+                        String userPassword = scanner.nextLine().trim();
+                        if (userPassword.isEmpty()) {
+                            System.out.println("The system requires a password.");
+                            break;
+                        }
+
+                        String answer = authClient(userPassword);
+                        System.out.println(answer);
+                        break;
                     case "PUT":
+                        if (clientPassword == null) {
+                            System.out.println("You have to REGISTER or AUTH first.");
+                            break;
+                        }
                         System.out.print("Enter local file path: ");
                         String path = scanner.nextLine();
                         File file = new File(path);
@@ -48,27 +88,45 @@ public class BlockStorageClient {
                         }
                         System.out.print("Enter keywords (comma-separated): ");
                         String kwLine = scanner.nextLine();
-                        String[] input = new String[3];
-                        input = readCryptoConfig();
-                        String ciphersuite = input[0].split(" ")[1];
-                        String user = input[1].split(" ")[1];
-                        password = input[2].split(" ")[1];
+                        String[] input = readCryptoConfig();
+                        if (input == null) {
+                            System.out.println("Crypto config file is null.");
+                            break;
+                        }
 
-                        encryptor = new FileEncryption(ciphersuite, password.toCharArray());
+                        String ciphersuite = input[0];
+                        if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuite)) {
+                            encryptor = new FileEncryption(ciphersuite, clientPassword.toCharArray());
+                        }
+
                         List<String> keywords = new ArrayList<>();
                         if (!kwLine.trim().isEmpty()) {
                             for (String kw : kwLine.split(","))
                                 keywords.add(kw.trim().toLowerCase());
                         }
-                        putFile(file, keywords, password, out, in);
+                        putFile(file, keywords, clientPassword, out, in);
                         saveIndex();
                         break;
 
                     case "GET":
+                        if (clientPassword == null) {
+                            System.out.println("You have to REGISTER or AUTH first.");
+                            break;
+                        }
                         System.out.print("Enter filename to retrieve: ");
                         String filename = scanner.nextLine();
-                        decryptor = new FileDecryption(encryptor.ciphersuite);
-                        getFile(filename, password, out, in);
+
+                        String[] configInput = readCryptoConfig();
+                        if (configInput == null) {
+                            System.out.println("Crypto config file is null.");
+                            break;
+                        }
+                        String ciphersuiteInput = configInput[0];
+                        if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuiteInput)) {
+                            encryptor = new FileEncryption(ciphersuiteInput, clientPassword.toCharArray());
+                        }
+                        decryptor = new FileDecryption(encryptor.getCypherSuite());
+                        getFile(filename, clientPassword, out, in);
                         break;
 
                     case "LIST":
@@ -97,6 +155,92 @@ public class BlockStorageClient {
         } finally {
             socket.close();
         }
+    }
+
+    private static String registerClient(String password) {
+        try (Socket socket = new Socket("localhost", OAS_PORT);
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                DataInputStream in = new DataInputStream(socket.getInputStream())) {
+
+            byte[] salt = new byte[16];
+            new java.security.SecureRandom().nextBytes(salt);
+
+            saveSalt(salt);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
+
+            String publicKey = ECCKeyManager.getPublicKeyBase64(keyPair);
+
+            out.writeUTF("CREATE_REG");
+            out.writeUTF(publicKey);
+            out.writeUTF(Base64.getEncoder().encodeToString(salt));
+            out.writeUTF(Base64.getEncoder().encodeToString(passwordHash));
+
+            out.writeInt(0); // TODO: write attributes
+            out.flush();
+
+            return in.readUTF();
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "ERROR_EXCEPTION: " + e.getMessage();
+        }
+    }
+
+    private static String authClient(String password) {
+        try (Socket socket = new Socket("localhost", OAS_PORT);
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                DataInputStream in = new DataInputStream(socket.getInputStream())) {
+
+            String publicKey = ECCKeyManager.getPublicKeyBase64(keyPair);
+
+            out.writeUTF("AUTH_START");
+            out.writeUTF(publicKey);
+            out.flush();
+
+            String nonce = in.readUTF();
+            long timeStamp = in.readLong();
+
+            String msg = nonce + "|" + timeStamp;
+            byte[] signature = ECCKeyManager.sign(keyPair.getPrivate(), msg.getBytes());
+
+            byte[] salt = loadSalt();
+
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
+
+            out.writeUTF("AUTH_RESP");
+            out.writeUTF(publicKey);
+            out.writeUTF(nonce);
+            out.writeLong(timeStamp);
+            out.writeUTF(Base64.getEncoder().encodeToString(signature));
+            out.writeUTF(Base64.getEncoder().encodeToString(passwordHash));
+            out.flush();
+
+            String result = in.readUTF();
+            if (result.equals("OK_AUTH")) {
+                authToken = in.readUTF();
+                clientPassword = password;
+                return "You were authenticated. Your token is the following: " + authToken;
+            } else {
+                return "You were not authenticated: " + result;
+            }
+        } catch (FileNotFoundException fE) {
+            return "Salt not found. If you haven't, please REGISTER first.";
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "ERROR_EXCEPTION: " + e.getMessage();
+        }
+    }
+
+    private static void saveSalt(byte[] salt) throws IOException {
+        new File("client_auth").mkdirs();
+        try (FileOutputStream fos = new FileOutputStream(SALT_FILE)) {
+            fos.write(salt);
+        }
+    }
+
+    private static byte[] loadSalt() throws IOException {
+        return java.nio.file.Files.readAllBytes(new File(SALT_FILE).toPath());
     }
 
     private static void putFile(File file, List<String> keywords, String password, DataOutputStream out,
@@ -210,7 +354,19 @@ public class BlockStorageClient {
     private static String[] readCryptoConfig() {
         File configFile = new File("client/cryptoconfig.txt");
         try (BufferedReader reader = new BufferedReader(new FileReader(configFile))) {
-            return reader.lines().toArray(String[]::new);
+            List<String> lines = new ArrayList<>();
+            reader.lines().forEach(lines::add);
+            String ciphersuite = null;
+            String user = null;
+            for (String line : lines) {
+                if (line.toLowerCase().startsWith("ciphersuite:")) {
+                    ciphersuite = line.split(":", 2)[1].trim();
+                } else if (line.toLowerCase().startsWith("user:")) {
+                    user = line.split(":", 2)[1].trim();
+                }
+            }
+            if (ciphersuite == null) return null;
+            return new String[]{ciphersuite, user};
         } catch (Exception e) {
             e.printStackTrace();
             return null;
