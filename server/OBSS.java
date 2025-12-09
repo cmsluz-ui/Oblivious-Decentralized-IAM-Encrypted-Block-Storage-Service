@@ -17,7 +17,7 @@ public class OBSS {
     public static void main(String[] args) throws IOException {
         File dir = new File(BLOCK_DIR);
         if (!dir.exists())
-            dir.mkdir();
+            dir.mkdirs();
         loadMetadata();
 
         ServerSocket serverSocket = new ServerSocket(PORT);
@@ -62,13 +62,14 @@ public class OBSS {
     }
 
     private static void storeBlock(DataInputStream in, DataOutputStream out) throws IOException {
-        String blockId = in.readUTF();
+        String token = in.readUTF();
+        String encryptedBlockId = in.readUTF();
         int length = in.readInt();
         byte[] data = new byte[length];
         in.readFully(data);
 
         // Write block to disk
-        File blockFile = new File(BLOCK_DIR, blockId);
+        File blockFile = new File(BLOCK_DIR, encryptedBlockId);
         try (FileOutputStream fos = new FileOutputStream(blockFile)) {
             fos.write(data);
         }
@@ -80,8 +81,11 @@ public class OBSS {
             for (int i = 0; i < keywordCount; i++) {
                 keywords.add(in.readUTF().toLowerCase());
             }
-            metadata.put(blockId, keywords);
+            metadata.put(encryptedBlockId, keywords);
             saveMetadata();
+        }
+        if (token != null && !token.isEmpty()) {
+            notifyOwnerToOAMS(token, encryptedBlockId);
         }
 
         out.writeUTF("OK");
@@ -89,18 +93,39 @@ public class OBSS {
     }
 
     private static void getBlock(DataInputStream in, DataOutputStream out) throws IOException {
-        String blockId = in.readUTF();
-        File blockFile = new File(BLOCK_DIR, blockId);
+        String token = in.readUTF();
+        String encryptedBlockId = in.readUTF();
+
+        boolean allowed = false;
+        try (Socket oams = new Socket("localhost", 7000);
+                DataOutputStream outOAMS = new DataOutputStream(oams.getOutputStream());
+                DataInputStream inOAMS = new DataInputStream(oams.getInputStream())) {
+            outOAMS.writeUTF("CHECK_ACCESS");
+            outOAMS.writeUTF(token == null ? "" : token);
+            outOAMS.writeUTF(encryptedBlockId);
+            outOAMS.flush();
+
+            String response = inOAMS.readUTF();
+            allowed = "OK_ACCESS".equals(response); // TODO: estranho equals
+        } catch (Exception e) {
+            allowed = false;
+        }
+
+        if (!allowed) {
+            out.writeInt(-1);
+            out.flush();
+            return;
+        }
+
+        File blockFile = new File(BLOCK_DIR, encryptedBlockId);
         if (!blockFile.exists()) {
             out.writeInt(-1);
-        } else {
-            byte[] data = new byte[(int) blockFile.length()];
-            try (FileInputStream fis = new FileInputStream(blockFile)) {
-                fis.read(data);
-            }
-            out.writeInt(data.length);
-            out.write(data);
+            out.flush();
+            return;
         }
+        byte[] data = java.nio.file.Files.readAllBytes(blockFile.toPath());
+        out.writeInt(data.length);
+        out.write(data);
         out.flush();
     }
 
@@ -126,6 +151,18 @@ public class OBSS {
         for (String f : results)
             out.writeUTF(f);
         out.flush();
+    }
+
+    private static void notifyOwnerToOAMS(String token, String encryptedBlockId) {
+        try (Socket socket = new Socket("localhost", 7000);
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
+            out.writeUTF("REGISTER_OWNER");
+            out.writeUTF(token);
+            out.writeUTF(encryptedBlockId);
+            out.flush();
+        } catch (Exception e) {
+            System.out.println("Could not notify OAMS about owner for block " + encryptedBlockId);
+        }
     }
 
     private static void saveMetadata() {

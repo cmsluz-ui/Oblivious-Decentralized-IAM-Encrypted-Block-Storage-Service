@@ -15,11 +15,18 @@ import javax.crypto.SecretKey;
 import streamciphers.PBKDF2;
 
 public class BlockStorageClient {
+
+    private static final String CLIENT_ID = System.getProperty("client", "default");
+    private static final String BASE_DIR = "clients/" + CLIENT_ID + "/";
+    private static final String AUTH_DIR = BASE_DIR + "client_auth/";
+
     private static final int OBSS_PORT = 5000;
     private static final int OAS_PORT = 6000;
     private static final int BLOCK_SIZE = 4096;
-    private static final String INDEX_FILE = "client_index.ser";
-    private static final String SALT_FILE = "client_auth/salt.bin";
+
+    private static final String INDEX_FILE = BASE_DIR + "client_index.ser";
+    private static final String SALT_FILE = AUTH_DIR + "salt.bin";
+    private static final String CRYPTO_CONFIG = BASE_DIR + "cryptoconfig.txt";
 
     private static Map<String, List<String>> fileIndex = new HashMap<>();
 
@@ -32,10 +39,16 @@ public class BlockStorageClient {
 
     private static String clientPassword = null;
 
-    public static void main(String[] args) throws IOException, ClassNotFoundException, Exception {
-        loadIndex();
+    public static void main(String[] args) throws Exception {
+        System.out.println("=== CLIENT ID: " + CLIENT_ID + " ===");
 
+        new File(BASE_DIR).mkdirs();
+        new File(AUTH_DIR).mkdirs();
+
+        ECCKeyManager.init(BASE_DIR);
         keyPair = ECCKeyManager.loadKeyPair();
+
+        loadIndex();
 
         Socket socket = new Socket("localhost", OBSS_PORT);
         kwSec = new KeywordSecurity();
@@ -45,12 +58,12 @@ public class BlockStorageClient {
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                 Scanner scanner = new Scanner(System.in);) {
             while (true) {
-                System.out.print("Command (REGISTER/AUTH/PUT/GET/LIST/SEARCH/EXIT): ");
-                String cmd = scanner.nextLine().toUpperCase();
+                System.out.print("Command (REGISTER/AUTH/PUT/GET/LIST/SEARCH/SHARE/EXIT): ");
+                String cmd = scanner.nextLine().trim().toUpperCase();
 
                 switch (cmd) {
                     case "REGISTER":
-                        System.out.println("Create password: ");
+                        System.out.print("Create password: ");
                         String sessionPassword = scanner.nextLine().trim();
                         if (sessionPassword.isEmpty()) {
                             System.out.println("The system requires a password.");
@@ -64,7 +77,7 @@ public class BlockStorageClient {
                         }
                         break;
                     case "AUTH":
-                        System.out.println("Enter your password: ");
+                        System.out.print("Enter your password: ");
                         String userPassword = scanner.nextLine().trim();
                         if (userPassword.isEmpty()) {
                             System.out.println("The system requires a password.");
@@ -75,8 +88,8 @@ public class BlockStorageClient {
                         System.out.println(answer);
                         break;
                     case "PUT":
-                        if (clientPassword == null) {
-                            System.out.println("You have to REGISTER or AUTH first.");
+                        if (clientPassword == null || authToken == null) {
+                            System.out.println("You have to REGISTER and AUTH first.");
                             break;
                         }
                         System.out.print("Enter local file path: ");
@@ -94,7 +107,7 @@ public class BlockStorageClient {
                             break;
                         }
 
-                        String ciphersuite = input[0];
+                        String ciphersuite = input[0].contains(":") ? input[0].split(":", 2)[1].trim() : input[0].trim();
                         if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuite)) {
                             encryptor = new FileEncryption(ciphersuite, clientPassword.toCharArray());
                         }
@@ -109,8 +122,8 @@ public class BlockStorageClient {
                         break;
 
                     case "GET":
-                        if (clientPassword == null) {
-                            System.out.println("You have to REGISTER or AUTH first.");
+                        if (clientPassword == null || authToken == null) {
+                            System.out.println("You have to REGISTER and AUTH first.");
                             break;
                         }
                         System.out.print("Enter filename to retrieve: ");
@@ -121,7 +134,7 @@ public class BlockStorageClient {
                             System.out.println("Crypto config file is null.");
                             break;
                         }
-                        String ciphersuiteInput = configInput[0];
+                        String ciphersuiteInput = configInput[0].contains(":") ? configInput[0].split(":", 2)[1].trim() : configInput[0].trim();
                         if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuiteInput)) {
                             encryptor = new FileEncryption(ciphersuiteInput, clientPassword.toCharArray());
                         }
@@ -130,7 +143,7 @@ public class BlockStorageClient {
                         break;
 
                     case "LIST":
-                        System.out.println("Stored files:");
+                        System.out.print("Stored files:");
                         for (String f : fileIndex.keySet())
                             System.out.println(" - " + f);
                         break;
@@ -141,6 +154,30 @@ public class BlockStorageClient {
                         searchFiles(keyword, out, in);
                         break;
 
+                    case "SHARE":
+                        if (authToken == null) {
+                            System.out.println("You must AUTH before sharing.");
+                            break;
+                        }
+                        System.out.print("Enter the file you want to share: ");
+                        String shareName = scanner.nextLine();
+
+                        List<String> blocks = fileIndex.get(shareName);
+                        if (blocks == null) {
+                            System.out.println("That file is not in the index");
+                            break;
+                        }
+
+                        System.out.print("Enter the public key of the recipient: ");
+                        String recipientPublicKey = scanner.nextLine();
+
+                        for (String blockId : blocks) {
+                            String encryptedBlockId = bytesToHex(kwSec.encryptKeyword(blockId));
+                            shareBlock(encryptedBlockId, recipientPublicKey);
+                        }
+
+                        System.out.println("File successfully shared");
+                        break;
                     case "EXIT":
                         out.writeUTF("EXIT");
                         out.flush();
@@ -252,7 +289,7 @@ public class BlockStorageClient {
             int bytesRead;
             int blockNum = 0;
             PBKDF2 pbkdf2 = new PBKDF2(password.toCharArray());
-            SecretKey passwordKey = pbkdf2.deriveKey(file.getName(), encryptor.ciphersuite);
+            SecretKey passwordKey = pbkdf2.deriveKey(file.getName(), encryptor.getCypherSuite());
 
             while ((bytesRead = fis.read(buffer)) != -1) {
                 byte[] blockData = Arrays.copyOf(buffer, bytesRead);
@@ -261,6 +298,7 @@ public class BlockStorageClient {
                 String encryptedBlockId = bytesToHex(kwSec.encryptKeyword(blockId));
 
                 out.writeUTF("STORE_BLOCK");
+                out.writeUTF(authToken == null ? "" : authToken);
                 out.writeUTF(encryptedBlockId);
                 out.writeInt(blockData.length);
                 out.write(blockData);
@@ -281,7 +319,7 @@ public class BlockStorageClient {
                 out.flush();
                 String response = in.readUTF();
                 if (!response.equals("OK")) {
-                    System.out.println("Error storing block: " + blockId);
+                    System.out.println("Error storing block: " + blockId + " -> " + response);
                     return;
                 }
                 blocks.add(blockId);
@@ -307,6 +345,7 @@ public class BlockStorageClient {
             for (String blockId : blocks) {
                 String encryptedBlockId = bytesToHex(kwSec.encryptKeyword(blockId));
                 out.writeUTF("GET_BLOCK");
+                out.writeUTF(authToken == null ? "" : authToken);
                 out.writeUTF(encryptedBlockId);
                 out.flush();
                 int length = in.readInt();
@@ -351,6 +390,24 @@ public class BlockStorageClient {
         }
     }
 
+    private static void shareBlock(String encryptedBlockId, String recipientPublicKey) {
+        try (Socket socket = new Socket("localhost", 7000);
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                DataInputStream in = new DataInputStream(socket.getInputStream())) {
+            out.writeUTF("CREATE_SHARE");
+            out.writeUTF(authToken == null ? "" : authToken);
+            out.writeUTF(encryptedBlockId);
+            out.writeUTF(recipientPublicKey);
+            out.writeUTF("GET");
+            out.flush();
+
+            String answer = in.readUTF();
+            System.out.println("Share block answer: " + answer);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
     private static String[] readCryptoConfig() {
         File configFile = new File("client/cryptoconfig.txt");
         try (BufferedReader reader = new BufferedReader(new FileReader(configFile))) {
@@ -365,8 +422,9 @@ public class BlockStorageClient {
                     user = line.split(":", 2)[1].trim();
                 }
             }
-            if (ciphersuite == null) return null;
-            return new String[]{ciphersuite, user};
+            if (ciphersuite == null)
+                return null;
+            return new String[] { ciphersuite, user };
         } catch (Exception e) {
             e.printStackTrace();
             return null;

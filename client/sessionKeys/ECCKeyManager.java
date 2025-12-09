@@ -4,28 +4,29 @@ import java.io.*;
 import java.security.*;
 import java.security.spec.*;
 import java.util.Base64;
-import java.nio.file.*;
 
 public class ECCKeyManager {
 
-    private static final String DIR = "client_keys";
-    private static final String PUB = DIR + "/public.key";
-    private static final String PRIV = DIR + "/private.key";
+    private static String DIR;
+    private static String PUB;
+    private static String PRIV;
+
+    public static void init(String baseDir) {
+        DIR = baseDir + "client_keys/";
+        PUB = DIR + "public.key";
+        PRIV = DIR + "private.key";
+        new File(DIR).mkdirs();
+    }
 
     public static KeyPair loadKeyPair() throws Exception {
-        File dir = new File(DIR);
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
-
         File pub = new File(PUB);
         File priv = new File(PRIV);
 
         if (!pub.exists() || !priv.exists()) {
-            return storeKeyPair();
+            return loadExistingKeyPair();
         }
 
-        return loadExistingKeyPair();
+        return storeKeyPair();
     }
 
     private static KeyPair storeKeyPair() throws Exception {
@@ -33,15 +34,19 @@ public class ECCKeyManager {
         generator.initialize(new ECGenParameterSpec("secp256r1"));
         KeyPair keyPair = generator.generateKeyPair();
 
-        Files.write(Paths.get(PUB), keyPair.getPublic().getEncoded());
-        Files.write(Paths.get(PRIV), keyPair.getPrivate().getEncoded());
+        try (FileOutputStream fos = new FileOutputStream(PUB)) {
+            fos.write(keyPair.getPublic().getEncoded());
+        }
+        try (FileOutputStream fos = new FileOutputStream(PRIV)) {
+            fos.write(keyPair.getPrivate().getEncoded());
+        }
 
         return keyPair;
     }
 
     private static KeyPair loadExistingKeyPair() throws Exception {
-        byte[] pub = Files.readAllBytes(Paths.get(PUB));
-        byte[] priv = Files.readAllBytes(Paths.get(PRIV));
+        byte[] pub = readAll(PUB);
+        byte[] priv = readAll(PRIV);
 
         KeyFactory factory = KeyFactory.getInstance("EC");
 
@@ -49,6 +54,10 @@ public class ECCKeyManager {
         PrivateKey privateKey = factory.generatePrivate(new PKCS8EncodedKeySpec(priv));
 
         return new KeyPair(publicKey, privateKey);
+    }
+
+    private static byte[] readAll(String path) throws Exception {
+        return java.nio.file.Files.readAllBytes(new File(path).toPath());
     }
 
     public static String getPublicKeyBase64(KeyPair key) {
