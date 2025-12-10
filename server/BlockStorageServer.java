@@ -89,8 +89,32 @@ public class BlockStorageServer {
     }
 
     private static void getBlock(DataInputStream in, DataOutputStream out) throws IOException {
-        String blockId = in.readUTF();
-        File blockFile = new File(BLOCK_DIR, blockId);
+        String token = in.readUTF();
+        String encryptedBlockId = in.readUTF();
+
+        boolean allowed = false;
+try (Socket oams = new Socket("localhost", 7000);
+     DataOutputStream outOAMS = new DataOutputStream(oams.getOutputStream());
+     DataInputStream inOAMS = new DataInputStream(oams.getInputStream())) {
+
+    outOAMS.writeUTF("CHECK_ACCESS");
+    outOAMS.writeUTF(token == null ? "" : token);
+    outOAMS.writeUTF(encryptedBlockId); // pass file/block anonId
+    outOAMS.flush();
+
+    String response = inOAMS.readUTF();
+    allowed = "OK_ACCESS".equals(response); // Only serve if OK_ACCESS
+} catch (Exception e) {
+    allowed = false;
+}
+
+if (!allowed) {
+    out.writeInt(-1); // deny access
+    out.flush();
+    return;
+}
+
+        File blockFile = new File(BLOCK_DIR, encryptedBlockId);
         if (!blockFile.exists()) {
             out.writeInt(-1);
         } else {

@@ -5,6 +5,10 @@ import encryption.KeywordSecurity;
 import static encryption.KeywordSecurity.bytesToHex;
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.MessageDigest;
+import java.security.UnrecoverableKeyException;
 import java.util.*;
 
 import javax.crypto.SecretKey;
@@ -175,9 +179,14 @@ public class BlockStorageClient {
                 byte[] decryptedBlock = null;
                 try {
                     decryptedBlock = decryptor.decrypt(data, filename);
+                } catch (UnrecoverableKeyException e) {
+                    System.out.println("Cannot decrypt: you do not have permission for this file.");
+                    return;
                 } catch (Exception e) {
                     e.printStackTrace();
+                    return;
                 }
+
                 System.out.print(".");
                 fos.write(decryptedBlock);
             }
