@@ -249,22 +249,21 @@ public class BlockStorageClient {
             String publicKey = ECCKeyManager.getPublicKeyBase64(keyPair);
             String saltb64 = Base64.getEncoder().encodeToString(salt);
             String PW = Base64.getEncoder().encodeToString(passwordHash);
-            
+
             String plaintext = publicKey + "|" + saltb64 + "|" + PW;
             byte[] plaintextBytes = plaintext.getBytes(StandardCharsets.UTF_8);
-            
+
             byte[] plaintextHash = digest.digest(plaintextBytes);
             String plaintextB64 = Base64.getEncoder().encodeToString(plaintextHash);
             byte[] signature = ECCKeyManager.sign(keyPair.getPrivate(), plaintextHash);
             String signatureB64 = Base64.getEncoder().encodeToString(signature);
 
-
             out.writeUTF("CREATE_REG");
             out.writeUTF(plaintext);
             out.writeUTF(plaintextB64);
             out.writeUTF(signatureB64);
-           
-            out.writeInt(0); // TODO: write attributes
+
+            out.writeInt(0);
             out.flush();
             return in.readUTF();
         } catch (Exception e) {
@@ -274,56 +273,54 @@ public class BlockStorageClient {
     }
 
     private static String authClient(String password) {
-    try (Socket socket = new Socket("localhost", OAS_PORT)) {
-        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-        DataInputStream in = new DataInputStream(socket.getInputStream());
+        try (Socket socket = new Socket("localhost", OAS_PORT)) {
+            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+            DataInputStream in = new DataInputStream(socket.getInputStream());
 
             clientUsername = username;
             loadIndex(username);
 
-        out.writeUTF("AUTH_START");
-        out.writeUTF(publicKey);
-        out.flush();
+            out.writeUTF("AUTH_START");
+            out.writeUTF(publicKey);
+            out.flush();
 
-        String nonce = in.readUTF();
-        long timeStamp = in.readLong();
+            String nonce = in.readUTF();
+            long timeStamp = in.readLong();
 
-        byte[] salt = loadSalt();
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
-        String pwHashB64 = Base64.getEncoder().encodeToString(passwordHash);
+            byte[] salt = loadSalt();
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
+            String pwHashB64 = Base64.getEncoder().encodeToString(passwordHash);
 
-        String msg = nonce + "|" + timeStamp + "|" + publicKey + "|" + pwHashB64;
-        byte[] signature = ECCKeyManager.sign(keyPair.getPrivate(), msg.getBytes(StandardCharsets.UTF_8));
-        String signatureB64 = Base64.getEncoder().encodeToString(signature);
+            String msg = nonce + "|" + timeStamp + "|" + publicKey + "|" + pwHashB64;
+            byte[] signature = ECCKeyManager.sign(keyPair.getPrivate(), msg.getBytes(StandardCharsets.UTF_8));
+            String signatureB64 = Base64.getEncoder().encodeToString(signature);
 
-        out.writeUTF("AUTH_RESP");
-        out.writeUTF(publicKey);
-        out.writeUTF(nonce);
-        out.writeLong(timeStamp);
-        out.writeUTF(signatureB64);
-        out.writeUTF(pwHashB64);
-        out.flush();
+            out.writeUTF("AUTH_RESP");
+            out.writeUTF(publicKey);
+            out.writeUTF(nonce);
+            out.writeLong(timeStamp);
+            out.writeUTF(signatureB64);
+            out.writeUTF(pwHashB64);
+            out.flush();
 
-       
-        String result = in.readUTF();
-        if ("OK_AUTH".equals(result)) {
-            authToken = in.readUTF();
-            clientPassword = password;
-            return "You were authenticated. Your token is: " + authToken;
-        } else {
-            return "Authentication failed: " + result;
+            String result = in.readUTF();
+            if ("OK_AUTH".equals(result)) {
+                authToken = in.readUTF();
+                clientPassword = password;
+                return "You were authenticated. Your token is: " + authToken;
+            } else {
+                return "Authentication failed: " + result;
+            }
+        } catch (FileNotFoundException fE) {
+            return "Salt not found. Please REGISTER first.";
+        } catch (SocketTimeoutException t) {
+            return "Authentication timed out. Server not responding.";
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "ERROR: " + e.getMessage();
         }
-    } catch (FileNotFoundException fE) {
-        return "Salt not found. Please REGISTER first.";
-    } catch (SocketTimeoutException t) {
-        return "Authentication timed out. Server not responding.";
-    } catch (Exception e) {
-        e.printStackTrace();
-        return "ERROR: " + e.getMessage();
     }
-}
-
 
     private static void saveSalt(byte[] salt) throws IOException {
         new File(AUTH_DIR).mkdirs();
@@ -370,7 +367,7 @@ public class BlockStorageClient {
                     System.out.println("ciphersuite used: " + encryptor.getCypherSuite());
                     System.out.println("/nSent keywords./n");
                 } else {
-                    out.writeInt(0); 
+                    out.writeInt(0);
                 }
 
                 out.flush();
