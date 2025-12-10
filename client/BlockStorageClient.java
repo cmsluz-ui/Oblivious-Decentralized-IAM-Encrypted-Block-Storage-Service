@@ -26,6 +26,7 @@ public class BlockStorageClient {
 
     private static final int OBSS_PORT = 5000;
     private static final int OAS_PORT = 6000;
+    private static final int OAMS_PORT = 7000;
     private static final int BLOCK_SIZE = 4096;
 
     private static final String INDEX_FILE = BASE_DIR + "client_index.ser";
@@ -33,6 +34,7 @@ public class BlockStorageClient {
     private static final String CRYPTO_CONFIG = "client/cryptoconfig.txt";
 
     private static Map<String, List<String>> fileIndex = new HashMap<>();
+    private static Map<String, String> ciphersuiteIndex = new HashMap<>();
 
     private static FileEncryption encryptor = null;
     private static FileDecryption decryptor = null;
@@ -42,6 +44,7 @@ public class BlockStorageClient {
     private static String authToken = null;
 
     private static String clientPassword = null;
+    private static String clientUsername = null;
 
     public static void main(String[] args) throws Exception {
         System.out.println("=== CLIENT ID: " + CLIENT_ID + " ===");
@@ -64,7 +67,6 @@ public class BlockStorageClient {
             while (true) {
                 System.out.print("Command (REGISTER/AUTH/PUT/GET/LIST/SEARCH/SHARE/EXIT): ");
                 String cmd = scanner.nextLine().trim().toUpperCase();
-
                 switch (cmd) {
                     case "REGISTER":
                         System.out.print("Create password: ");
@@ -79,8 +81,15 @@ public class BlockStorageClient {
                         if (result != null && result.startsWith("OK")) {
                             clientPassword = sessionPassword;
                         }
+                        createIndex();
                         break;
                     case "AUTH":
+                        System.out.print("Enter your username: ");
+                        String username = scanner.nextLine().trim();
+                        if (username.isEmpty()) {
+                            System.out.println("The system requires a username.");
+                            break;
+                        }
                         System.out.print("Enter your password: ");
                         String userPassword = scanner.nextLine().trim();
                         if (userPassword.isEmpty()) {
@@ -88,7 +97,9 @@ public class BlockStorageClient {
                             break;
                         }
 
-                        String answer = authClient(userPassword);
+                        String answer = authClient(username, userPassword);
+                        saveIndex();
+
                         System.out.println(answer);
                         break;
                     case "PUT":
@@ -111,7 +122,8 @@ public class BlockStorageClient {
                             break;
                         }
 
-                        String ciphersuite = input[0].contains(":") ? input[0].split(":", 2)[1].trim() : input[0].trim();
+                        String ciphersuite = input[0].contains(":") ? input[0].split(":", 2)[1].trim()
+                                : input[0].trim();
                         if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuite)) {
                             encryptor = new FileEncryption(ciphersuite, clientPassword.toCharArray());
                         }
@@ -122,6 +134,7 @@ public class BlockStorageClient {
                                 keywords.add(kw.trim().toLowerCase());
                         }
                         putFile(file, keywords, clientPassword, out, in);
+                        ciphersuiteIndex.put(file.getName(), ciphersuite);
                         saveIndex();
                         break;
 
@@ -133,23 +146,23 @@ public class BlockStorageClient {
                         System.out.print("Enter filename to retrieve: ");
                         String filename = scanner.nextLine();
 
-                        String[] configInput = readCryptoConfig();
-                        if (configInput == null) {
-                            System.out.println("Crypto config file is null.");
-                            break;
-                        }
-                        String ciphersuiteInput = configInput[0].contains(":") ? configInput[0].split(":", 2)[1].trim() : configInput[0].trim();
-                        if (encryptor == null || !encryptor.getCypherSuite().equals(ciphersuiteInput)) {
-                            encryptor = new FileEncryption(ciphersuiteInput, clientPassword.toCharArray());
+                        String fileCipher = ciphersuiteIndex.get(filename);
+                        if (encryptor == null || !encryptor.getCypherSuite().equals(fileCipher)) {
+                            encryptor = new FileEncryption(fileCipher, clientPassword.toCharArray());
                         }
                         decryptor = new FileDecryption(encryptor.getCypherSuite());
                         getFile(filename, clientPassword, out, in);
+                        saveIndex();
                         break;
 
                     case "LIST":
-                        System.out.print("Stored files:");
-                        for (String f : fileIndex.keySet())
-                            System.out.println(" - " + f);
+                        System.out.println("Stored files:");
+                        if (fileIndex.keySet().isEmpty())
+                            System.out.println("The storage is empty.");
+                        else {
+                            for (String f : fileIndex.keySet())
+                                System.out.println(" - " + f);
+                        }
                         break;
 
                     case "SEARCH":
@@ -172,17 +185,19 @@ public class BlockStorageClient {
                             break;
                         }
 
-                        System.out.print("Enter the public key of the recipient: ");
-                        String recipientPublicKey = scanner.nextLine();
-
+                        System.out.print("Enter the name of the recipient: ");
+                        String recipientName = scanner.nextLine();
                         for (String blockId : blocks) {
                             String encryptedBlockId = bytesToHex(kwSec.encryptKeyword(blockId));
-                            shareBlock(encryptedBlockId, recipientPublicKey);
+                            shareBlock(encryptedBlockId, recipientName);
                         }
 
+                        changeRecipientFileIndex(shareName, recipientName);
                         System.out.println("File successfully shared");
                         break;
                     case "EXIT":
+                        if (!deleteUsers())
+                            System.out.println("Users.ser was not deleted.");
                         out.writeUTF("EXIT");
                         out.flush();
                         saveIndex();
@@ -198,7 +213,18 @@ public class BlockStorageClient {
         }
     }
 
-    private static String registerClient(String password) {
+    private static boolean deleteUsers() {
+        File users = new File("users.ser");
+        if (users.exists()) {
+            if (users.delete())
+                return true;
+            else
+                return false;
+        } else
+            return false;
+    }
+
+    private static String registerClient(String username, String password) {
         try (Socket socket = new Socket("localhost", OAS_PORT);
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                 DataInputStream in = new DataInputStream(socket.getInputStream())) {
@@ -206,11 +232,20 @@ public class BlockStorageClient {
             byte[] salt = new byte[16];
             new java.security.SecureRandom().nextBytes(salt);
 
-            saveSalt(salt);
+            clientPassword = password;
+            loadIndex(username);
+
+            new File(BASE_DIR).mkdirs();
+            new File(AUTH_DIR).mkdirs();
+
+            ECCKeyManager.init(BASE_DIR);
+            keyPair = ECCKeyManager.loadKeyPair();
+
+            createCryptoconfig();
+            saveSalt(CLIENT_ID, salt);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
 
-            //Building the Message to send to OAS
             String publicKey = ECCKeyManager.getPublicKeyBase64(keyPair);
             String saltb64 = Base64.getEncoder().encodeToString(salt);
             String PW = Base64.getEncoder().encodeToString(passwordHash);
@@ -231,9 +266,6 @@ public class BlockStorageClient {
            
             out.writeInt(0); // TODO: write attributes
             out.flush();
-                        // Mensagem || assinatura
-                       // encripto os dados com a public key do server, faco hash dos dados em plaintext e assino com a minha private key
-                       //o server desencripta com a private key dele, verifica a assinatura com a minha public key e compara o hash  
             return in.readUTF();
         } catch (Exception e) {
             e.printStackTrace();
@@ -246,7 +278,8 @@ public class BlockStorageClient {
         DataOutputStream out = new DataOutputStream(socket.getOutputStream());
         DataInputStream in = new DataInputStream(socket.getInputStream());
 
-        String publicKey = ECCKeyManager.getPublicKeyBase64(keyPair);
+            clientUsername = username;
+            loadIndex(username);
 
         out.writeUTF("AUTH_START");
         out.writeUTF(publicKey);
@@ -314,6 +347,8 @@ public class BlockStorageClient {
             PBKDF2 pbkdf2 = new PBKDF2(password.toCharArray());
             SecretKey passwordKey = pbkdf2.deriveKey(file.getName(), encryptor.getCypherSuite());
 
+            loadIndex(clientUsername);
+
             while ((bytesRead = fis.read(buffer)) != -1) {
                 byte[] blockData = Arrays.copyOf(buffer, bytesRead);
                 blockData = encryptor.encrypt(blockData, passwordKey);
@@ -326,7 +361,6 @@ public class BlockStorageClient {
                 out.writeInt(blockData.length);
                 out.write(blockData);
 
-                // Send keywords for first block only
                 if (blockNum == 1) {
                     out.writeInt(keywords.size());
                     for (String kw : keywords) {
@@ -334,9 +368,9 @@ public class BlockStorageClient {
                         out.writeUTF(encryptedKw);
                     }
                     System.out.println("ciphersuite used: " + encryptor.getCypherSuite());
-                    System.out.println("/nSent keywords./n"); // Just for debug
+                    System.out.println("/nSent keywords./n");
                 } else {
-                    out.writeInt(0); // no keywords for other blocks
+                    out.writeInt(0); 
                 }
 
                 out.flush();
@@ -364,12 +398,14 @@ public class BlockStorageClient {
             System.out.println("File not found in local index.");
             return;
         }
+        loadIndex(clientUsername);
         try (FileOutputStream fos = new FileOutputStream("retrieved_" + filename)) {
             for (String blockId : blocks) {
                 String encryptedBlockId = bytesToHex(kwSec.encryptKeyword(blockId));
                 out.writeUTF("GET_BLOCK");
                 out.writeUTF(authToken == null ? "" : authToken);
                 out.writeUTF(encryptedBlockId);
+                out.writeUTF(clientUsername);
                 out.flush();
                 int length = in.readInt();
                 if (length == -1) {
@@ -396,6 +432,7 @@ public class BlockStorageClient {
     }
 
     private static void searchFiles(String keyword, DataOutputStream out, DataInputStream in) throws IOException {
+        loadIndex(clientUsername);
         try {
             out.writeUTF("SEARCH");
             String encryptedKw = bytesToHex(kwSec.encryptKeyword(keyword));
@@ -413,14 +450,17 @@ public class BlockStorageClient {
         }
     }
 
-    private static void shareBlock(String encryptedBlockId, String recipientPublicKey) {
-        try (Socket socket = new Socket("localhost", 7000);
+    private static void shareBlock(String encryptedBlockId, String recipientName) {
+        loadIndex(clientUsername);
+        String recipientPublicKey = "clients\\" + recipientName + "\\client_keys\\public.key";
+        try (Socket socket = new Socket("localhost", OAMS_PORT);
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                 DataInputStream in = new DataInputStream(socket.getInputStream())) {
             out.writeUTF("CREATE_SHARE");
             out.writeUTF(authToken == null ? "" : authToken);
             out.writeUTF(encryptedBlockId);
             out.writeUTF(recipientPublicKey);
+            out.writeUTF(recipientName);
             out.writeUTF("GET");
             out.flush();
 
@@ -429,6 +469,13 @@ public class BlockStorageClient {
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private static void changeRecipientFileIndex(String fileName, String recipient) {
+        Map<String, List<String>> recipientFileIndex = readFileIndex(recipient);
+        Map<String, List<String>> newFileIndex = new HashMap<>(recipientFileIndex);
+        newFileIndex.put(fileName, fileIndex.get(fileName));
+        changeIndex(newFileIndex, "clients\\" + recipient + "\\client_index.ser");
     }
 
     private static String[] readCryptoConfig() {
@@ -454,6 +501,20 @@ public class BlockStorageClient {
         }
     }
 
+    private static boolean createCryptoconfig() {
+        File configFile = new File(CRYPTO_CONFIG);
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(CRYPTO_CONFIG))) {
+            writer.write("Ciphersuite: AES_256/GCM/NoPadding\n");
+            writer.write("User: " + CLIENT_ID);
+            writer.newLine();
+            writer.write("Password: " + clientPassword);
+        } catch (Exception e) {
+            System.out.println("Config file failed to write attributes.");
+            return false;
+        }
+        return true;
+    }
+
     private static void saveIndex() {
         try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(INDEX_FILE))) {
             oos.writeObject(fileIndex);
@@ -462,7 +523,44 @@ public class BlockStorageClient {
         }
     }
 
-    private static void loadIndex() {
+    private static void changeIndex(Map<String, List<String>> index, String path) {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(path))) {
+            oos.writeObject(index);
+        } catch (IOException e) {
+            System.err.println("Failed to change index: " + e.getMessage());
+        }
+    }
+
+    private static Map<String, List<String>> readFileIndex(String owner) {
+        String indexPath = "clients\\" + owner + "\\client_index.ser";
+        File index = new File(indexPath);
+
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(index))) {
+            return (Map<String, List<String>>) ois.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            System.err.println("Failed to get index: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static void createIndex() {
+        File indexFile = new File(INDEX_FILE);
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(indexFile))) {
+            Map<String, List<String>> newFile = new HashMap<>();
+            oos.writeObject(newFile);
+        } catch (IOException e) {
+            System.err.println("Failed to save index: " + e.getMessage());
+        }
+    }
+
+    private static void loadIndex(String username) {
+        CLIENT_ID = username;
+        BASE_DIR = "clients/" + CLIENT_ID + "/";
+        AUTH_DIR = BASE_DIR + "client_auth/";
+        INDEX_FILE = BASE_DIR + "client_index.ser";
+        SALT_FILE = AUTH_DIR + "salt.bin";
+        CRYPTO_CONFIG = BASE_DIR + "cryptoconfig.txt";
+
         File f = new File(INDEX_FILE);
         if (!f.exists())
             return;

@@ -1,7 +1,3 @@
-// Ref. Iniial code for a Java Implentation of a Block-Storage Server
-// This is a naive and insecure implementation as initial reference for
-// Project assignment
-
 import java.io.*;
 import java.net.*;
 import java.util.*;
@@ -11,6 +7,8 @@ public class OBSS {
     private static final String BLOCK_DIR = "server/blockstorage";
     private static final String META_FILE = "metadata.ser";
 
+    private static final Map<String, String> owners = new ConcurrentHashMap<>();
+    private static final String OWNERS_FILE = "owners.ser";
     // Map filename -> list of keywords
     private static Map<String, List<String>> metadata = new HashMap<>();
 
@@ -33,8 +31,13 @@ public class OBSS {
         try (
                 DataInputStream in = new DataInputStream(socket.getInputStream());
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());) {
-            String command;
-            while ((command = in.readUTF()) != null) {
+            while (true) {
+                String command;
+                try {
+                    command = in.readUTF();
+                } catch (Exception e) {
+                    break;
+                }
                 switch (command) {
                     case "STORE_BLOCK":
                         storeBlock(in, out);
@@ -56,8 +59,8 @@ public class OBSS {
                         break;
                 }
             }
-        } catch (IOException e) {
-            System.err.println("Client disconnected.");
+        } catch (Exception e) {
+            System.err.println("OBSS client disconnected or error: " + e.getMessage());
         }
     }
 
@@ -68,13 +71,41 @@ public class OBSS {
         byte[] data = new byte[length];
         in.readFully(data);
 
-        // Write block to disk
+        // Validate token with OAMS to get owner anonId
+        String ownerAnonId = null;
+        try (Socket oams = new Socket("localhost", 7000);
+                DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
+                DataInputStream inO = new DataInputStream(oams.getInputStream())) {
+
+            outO.writeUTF("VALIDATE_TOKEN");
+            outO.writeUTF(token == null ? "" : token);
+            outO.flush();
+
+            String response = inO.readUTF();
+            if ("OK_VALIDATE".equals(response)) {
+                ownerAnonId = inO.readUTF();
+            } else {
+                // token invalid - reject storing
+                out.writeUTF("ERROR_INVALID_TOKEN");
+                out.flush();
+                return;
+            }
+        } catch (Exception e) {
+            // couldn't reach OAMS; reject the store (fail closed)
+            out.writeUTF("ERROR_OAMS_UNAVAILABLE");
+            out.flush();
+            return;
+        }
+
         File blockFile = new File(BLOCK_DIR, encryptedBlockId);
         try (FileOutputStream fos = new FileOutputStream(blockFile)) {
             fos.write(data);
         }
 
-        // Read optional metadata (keywords)
+        // record owner mapping
+        owners.put(encryptedBlockId, ownerAnonId);
+        saveOwners();
+
         int keywordCount = in.readInt();
         if (keywordCount > 0) {
             List<String> keywords = new ArrayList<>();
@@ -84,9 +115,10 @@ public class OBSS {
             metadata.put(encryptedBlockId, keywords);
             saveMetadata();
         }
-        if (token != null && !token.isEmpty()) {
-            notifyOwnerToOAMS(token, encryptedBlockId);
-        }
+
+        // Inform OAMS about owner (optional - creates OAMS shareRecord owner if
+        // necessary)
+        notifyOwnerToOAMS(token, encryptedBlockId);
 
         out.writeUTF("OK");
         out.flush();
@@ -95,15 +127,19 @@ public class OBSS {
     private static void getBlock(DataInputStream in, DataOutputStream out) throws IOException {
         String token = in.readUTF();
         String encryptedBlockId = in.readUTF();
+        String recipientUsername = in.readUTF();
 
         boolean allowed = false;
+
+        // Primary check: ask OAMS for permission (OAMS now verifies signature)
         try (Socket oams = new Socket("localhost", 7000);
-                DataOutputStream outOAMS = new DataOutputStream(oams.getOutputStream());
-                DataInputStream inOAMS = new DataInputStream(oams.getInputStream())) {
-            outOAMS.writeUTF("CHECK_ACCESS");
-            outOAMS.writeUTF(token == null ? "" : token);
-            outOAMS.writeUTF(encryptedBlockId);
-            outOAMS.flush();
+                DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
+                DataInputStream inO = new DataInputStream(oams.getInputStream())) {
+
+            outO.writeUTF("CHECK_ACCESS");
+            outO.writeUTF(token == null ? "" : token);
+            outO.writeUTF(encryptedBlockId); // pass file/block anonId
+            outO.flush();
 
             String response = inOAMS.readUTF();
             allowed = "OK_ACCESS".equals(response); // TODO: estranho equals
@@ -181,6 +217,31 @@ public class OBSS {
             metadata = (Map<String, List<String>>) ois.readObject();
         } catch (IOException | ClassNotFoundException e) {
             System.err.println("Error loading metadata: " + e.getMessage());
+        }
+    }
+
+    private static void loadOwners() {
+        File f = new File(OWNERS_FILE);
+        if (!f.exists())
+            return;
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
+            Map<String, String> m = (Map<String, String>) ois.readObject();
+            owners.putAll(m);
+        } catch (Exception e) {
+            System.err.println("Error loading owners: " + e.getMessage());
+        }
+    }
+
+    private static void saveOwners() {
+        try {
+            Path tmp = Files.createTempFile("owners", ".ser");
+            try (ObjectOutputStream oos = new ObjectOutputStream(Files.newOutputStream(tmp))) {
+                oos.writeObject(new HashMap<>(owners));
+            }
+            Files.move(tmp, Paths.get(OWNERS_FILE), StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (Exception e) {
+            System.err.println("Error saving owners: " + e.getMessage());
         }
     }
 }
