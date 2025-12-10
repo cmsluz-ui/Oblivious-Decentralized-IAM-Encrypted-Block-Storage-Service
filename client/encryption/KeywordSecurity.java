@@ -1,5 +1,6 @@
 package encryption;
 
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
 import javax.crypto.Cipher;
@@ -25,7 +26,7 @@ public class KeywordSecurity {
 
     public byte[] encryptKeyword(String keyword) throws Exception {
         MessageDigest sha = MessageDigest.getInstance("SHA-256"); //vai buscar hash function
-        byte[] fullHash = sha.digest(keyword.getBytes()); //da hash da keyword
+        byte[] fullHash = sha.digest(keyword.getBytes(StandardCharsets.UTF_8)); //da hash da keyword
         byte[] nonce = Arrays.copyOf(fullHash, NONCE_SIZE); //usa a keyword como nonce
 
         SecretKeySpec spec = new SecretKeySpec(KEY_BYTES, "ChaCha20");
