@@ -1,5 +1,13 @@
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -14,13 +22,20 @@ public class OAMS {
     private static final Map<String, String> blockToFile = new ConcurrentHashMap<>();
 
     private static final ConcurrentMap<String, ShareRecord> shares = new ConcurrentHashMap<>();
-
+    private static final Path OAS_PUB_PATH = Paths.get("oaskeys", "oas_public.x509");
+    private static PublicKey oasPubKey = null;
     private static final long TOKEN_VALIDITY_MS = 5 * 60 * 1000; // 5 minutes
 
     public static void main(String[] args) throws IOException {
         ServerSocket serverSocket = new ServerSocket(PORT);
         System.out.println("OAMS running on port " + PORT);
-
+        try {
+        loadOASPublicKey();
+    } catch (Exception e) {
+        System.err.println("Failed to load OAS public key: " + e.getMessage());
+        e.printStackTrace();
+        return;
+    }
         ExecutorService pool = Executors.newCachedThreadPool();
 
         while (true) {
@@ -48,6 +63,9 @@ public class OAMS {
                     case "CREATE_SHARE":
                         createShare(in, out);
                         break;
+                    case "VALIDATE_TOKEN":   
+                    validateTokenRPC(in, out);
+                    break;
                     case "DELETE_SHARE":
                         deleteShare(in, out);
                         break;
@@ -97,6 +115,24 @@ public class OAMS {
             out.flush();
         }
     }
+
+    private static void validateTokenRPC(DataInputStream in, DataOutputStream out) throws IOException {
+    try {
+        String token = in.readUTF();
+        TokenInfo info = validateToken(token);
+        if (!info.valid) {
+            out.writeUTF("ERROR_INVALID_TOKEN: " + info.reason);
+            out.flush();
+            return;
+        }
+        out.writeUTF("OK_VALIDATE");
+        out.writeUTF(info.anonId);
+        out.flush();
+    } catch (Exception e) {
+        out.writeUTF("ERROR_VALIDATE_TOKEN_EXCEPTION");
+        out.flush();
+    }
+}
 
     private static void createShare(DataInputStream in, DataOutputStream out) throws IOException {
         try {
@@ -250,48 +286,70 @@ public class OAMS {
     }
 
     private static TokenInfo validateToken(String token) {
-        TokenInfo tokenInfo = new TokenInfo();
-        try {
-            if (token == null || token.isEmpty()) {
-                tokenInfo.valid = false;
-                tokenInfo.reason = "NO_TOKEN";
-                return tokenInfo;
-            }
-            byte[] raw = Base64.getDecoder().decode(token);
-            String s = new String(raw);
-            int p = s.indexOf('|');
-            if (p < 0) {
-                tokenInfo.valid = false;
-                tokenInfo.reason = "BAD_FORMAT";
-                return tokenInfo;
-            }
-            String anonId = s.substring(0, p);
-            long timeStamp = Long.parseLong(s.substring(p + 1));
-
-            long now = System.currentTimeMillis();
-            if (timeStamp <= 0 || Math.abs(now - timeStamp) > TOKEN_VALIDITY_MS) {
-                tokenInfo.valid = false;
-                tokenInfo.reason = "TOKEN_EXPIRED";
-                return tokenInfo;
-            }
-
-            boolean exists = checkAnonIdExistsWithAOS(anonId);
-            if (!exists) {
-                tokenInfo.valid = false;
-                tokenInfo.reason = "UNKNOWN_SUBJECT";
-                return tokenInfo;
-            }
-
-            tokenInfo.valid = true;
-            tokenInfo.anonId = anonId;
-            tokenInfo.issuedAt = timeStamp;
-            return tokenInfo;
-        } catch (Exception e) {
+    TokenInfo tokenInfo = new TokenInfo();
+    try {
+        if (token == null || token.isEmpty()) {
             tokenInfo.valid = false;
-            tokenInfo.reason = "PARSE_ERROR";
+            tokenInfo.reason = "NO_TOKEN";
             return tokenInfo;
         }
+        byte[] raw = Base64.getDecoder().decode(token);
+        String s = new String(raw, StandardCharsets.UTF_8);
+        // expected format: anonId|timeStamp|sigB64
+        int p1 = s.indexOf('|');
+        int p2 = s.indexOf('|', p1 + 1);
+        if (p1 < 0 || p2 < 0) {
+            tokenInfo.valid = false;
+            tokenInfo.reason = "BAD_FORMAT";
+            return tokenInfo;
+        }
+        String anonId = s.substring(0, p1);
+        long timeStamp = Long.parseLong(s.substring(p1 + 1, p2));
+        String sigB64 = s.substring(p2 + 1);
+        byte[] sigBytes = Base64.getDecoder().decode(sigB64);
+
+        long now = System.currentTimeMillis();
+        if (timeStamp <= 0 || Math.abs(now - timeStamp) > TOKEN_VALIDITY_MS) {
+            tokenInfo.valid = false;
+            tokenInfo.reason = "TOKEN_EXPIRED";
+            return tokenInfo;
+        }
+
+        // verify signature using OAS public key
+        try {
+            Signature verifier = Signature.getInstance("SHA256withECDSA");
+            verifier.initVerify(oasPubKey);
+            String payload = anonId + "|" + timeStamp;
+            verifier.update(payload.getBytes(StandardCharsets.UTF_8));
+            boolean ok = verifier.verify(sigBytes);
+            if (!ok) {
+                tokenInfo.valid = false;
+                tokenInfo.reason = "BAD_SIGNATURE";
+                return tokenInfo;
+            }
+        } catch (Exception e) {
+            tokenInfo.valid = false;
+            tokenInfo.reason = "SIG_VERIFY_ERROR";
+            return tokenInfo;
+        }
+
+        boolean exists = checkAnonIdExistsWithAOS(anonId);
+        if (!exists) {
+            tokenInfo.valid = false;
+            tokenInfo.reason = "UNKNOWN_SUBJECT";
+            return tokenInfo;
+        }
+
+        tokenInfo.valid = true;
+        tokenInfo.anonId = anonId;
+        tokenInfo.issuedAt = timeStamp;
+        return tokenInfo;
+    } catch (Exception e) {
+        tokenInfo.valid = false;
+        tokenInfo.reason = "PARSE_ERROR";
+        return tokenInfo;
     }
+}
 
     private static boolean checkAnonIdExistsWithAOS(String anonId) {
         try (Socket socket = new Socket(OAS_HOST, OAS_PORT);
@@ -310,6 +368,17 @@ public class OAMS {
             return false;
         }
     }
+    private static void loadOASPublicKey() throws Exception {
+    if (!Files.exists(OAS_PUB_PATH)) {
+        throw new IOException("OAS public key not found at " + OAS_PUB_PATH.toString());
+    }
+    byte[] pubBytes = Files.readAllBytes(OAS_PUB_PATH);
+    KeyFactory kf = KeyFactory.getInstance("EC");
+    X509EncodedKeySpec pubSpec = new X509EncodedKeySpec(pubBytes);
+    oasPubKey = kf.generatePublic(pubSpec);
+    System.out.println("Loaded OAS public key from " + OAS_PUB_PATH.toString());
+}
+
 
     private static String sha256Base64(String input) {
         try {

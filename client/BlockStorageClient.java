@@ -207,7 +207,7 @@ public class BlockStorageClient {
             byte[] salt = new byte[16];
             new java.security.SecureRandom().nextBytes(salt);
 
-            saveSalt(salt);
+            saveSalt(CLIENT_ID, salt);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
 
@@ -256,7 +256,7 @@ public class BlockStorageClient {
         String nonce = in.readUTF();
         long timeStamp = in.readLong();
 
-        byte[] salt = loadSalt();
+        byte[] salt = loadSalt(CLIENT_ID);
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] passwordHash = digest.digest((password + Base64.getEncoder().encodeToString(salt)).getBytes());
         String pwHashB64 = Base64.getEncoder().encodeToString(passwordHash);
@@ -293,16 +293,20 @@ public class BlockStorageClient {
 }
 
 
-    private static void saveSalt(byte[] salt) throws IOException {
-        new File(AUTH_DIR).mkdirs();
-        try (FileOutputStream fos = new FileOutputStream(SALT_FILE)) {
-            fos.write(salt);
-        }
+    private static void saveSalt(String username, byte[] salt) throws IOException {
+    new File(AUTH_DIR).mkdirs();
+    try (FileOutputStream fos = new FileOutputStream(AUTH_DIR + "salt_" + username + ".bin")) {
+        fos.write(salt);
     }
+}
 
-    private static byte[] loadSalt() throws IOException {
-        return java.nio.file.Files.readAllBytes(new File(SALT_FILE).toPath());
+    private static byte[] loadSalt(String username) throws IOException {
+    File f = new File(AUTH_DIR + "salt_" + username + ".bin");
+    if (!f.exists()) {
+        throw new FileNotFoundException("Salt file not found for user " + username);
     }
+    return java.nio.file.Files.readAllBytes(f.toPath());
+}
 
     private static void putFile(File file, List<String> keywords, String password, DataOutputStream out,
             DataInputStream in)

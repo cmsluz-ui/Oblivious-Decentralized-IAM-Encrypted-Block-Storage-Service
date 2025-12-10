@@ -1,8 +1,17 @@
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
@@ -17,8 +26,21 @@ public class OAS {
     private static final int PORT = 6000;
     private static Map<String, User> users = new HashMap<>();
     private static Map<String, String> pendingNonces = new ConcurrentHashMap<>();
-
+    private static final Path OAS_KEYS_DIR = Paths.get("oaskeys");
+    private static final Path OAS_PRIV_FILE = OAS_KEYS_DIR.resolve("oas_private.pkcs8");
+    private static final Path OAS_PUB_FILE  = OAS_KEYS_DIR.resolve("oas_public.x509");
+    private static PrivateKey oasPrivateKey = null;
+    private static PublicKey oasPublicKey = null;
+    
     public static void main(String[] args) throws IOException {
+
+        try {
+            loadOrCreateOASKeypair();
+        } catch (Exception e) {
+            System.err.println("Failed to load or create OAS keypair: " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
         ServerSocket serverSocket = new ServerSocket(PORT);
         System.out.println("OAS running on port " + PORT);
 
@@ -249,9 +271,55 @@ public class OAS {
     }
 
     private static String generateToken(String anonId) {
+    try {
         long ts = System.currentTimeMillis();
-        return Base64.getEncoder().encodeToString((anonId + "|" + ts).getBytes());
+        String payload = anonId + "|" + ts;
+        Signature signer = Signature.getInstance("SHA256withECDSA");
+        signer.initSign(oasPrivateKey);
+        signer.update(payload.getBytes(StandardCharsets.UTF_8));
+        byte[] signature = signer.sign();
+        String sigB64 = Base64.getEncoder().encodeToString(signature);
+        String tokenPlain = payload + "|" + sigB64; // anonId|ts|sigB64
+        return Base64.getEncoder().encodeToString(tokenPlain.getBytes(StandardCharsets.UTF_8));
+    } catch (Exception e) {
+        throw new RuntimeException("Failed to generate signed token: " + e.getMessage(), e);
     }
+}
+private static void loadOrCreateOASKeypair() throws Exception {
+    if (!Files.exists(OAS_KEYS_DIR)) {
+        Files.createDirectories(OAS_KEYS_DIR);
+    }
+
+    if (Files.exists(OAS_PRIV_FILE) && Files.exists(OAS_PUB_FILE)) {
+        // load keys
+        byte[] privBytes = Files.readAllBytes(OAS_PRIV_FILE);
+        byte[] pubBytes  = Files.readAllBytes(OAS_PUB_FILE);
+
+        KeyFactory kf = KeyFactory.getInstance("EC");
+        PKCS8EncodedKeySpec privSpec = new PKCS8EncodedKeySpec(privBytes);
+        X509EncodedKeySpec pubSpec = new X509EncodedKeySpec(pubBytes);
+
+        oasPrivateKey = kf.generatePrivate(privSpec);
+        oasPublicKey  = kf.generatePublic(pubSpec);
+        System.out.println("Loaded existing OAS ECDSA keypair.");
+    } else {
+        // generate new keypair
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
+        kpg.initialize(256); // secp256r1
+        KeyPair kp = kpg.generateKeyPair();
+
+        oasPrivateKey = kp.getPrivate();
+        oasPublicKey  = kp.getPublic();
+
+        // write keys to files (DER encoding)
+        Files.write(OAS_PRIV_FILE, oasPrivateKey.getEncoded());
+        Files.write(OAS_PUB_FILE, oasPublicKey.getEncoded());
+        System.out.println("Generated and saved new OAS ECDSA keypair to " + OAS_KEYS_DIR.toString());
+    }
+}
+    private static byte[] getOASPublicKeyBytes() {
+    return oasPublicKey.getEncoded();
+}
 
     private static void GetUserPubKey(DataInputStream in, DataOutputStream out) throws IOException {
         String anonId = in.readUTF();

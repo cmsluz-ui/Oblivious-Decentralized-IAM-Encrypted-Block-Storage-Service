@@ -4,13 +4,20 @@
 
 import java.io.*;
 import java.net.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class OBSS {
     private static final int PORT = 5000;
     private static final String BLOCK_DIR = "server/blockstorage";
     private static final String META_FILE = "metadata.ser";
 
+    private static final Map<String, String> owners = new ConcurrentHashMap<>();
+    private static final String OWNERS_FILE = "owners.ser";
     // Map filename -> list of keywords
     private static Map<String, List<String>> metadata = new HashMap<>();
 
@@ -62,73 +69,111 @@ public class OBSS {
     }
 
     private static void storeBlock(DataInputStream in, DataOutputStream out) throws IOException {
-        String token = in.readUTF();
-        String encryptedBlockId = in.readUTF();
-        int length = in.readInt();
-        byte[] data = new byte[length];
-        in.readFully(data);
+    String token = in.readUTF();
+    String encryptedBlockId = in.readUTF();
+    int length = in.readInt();
+    byte[] data = new byte[length];
+    in.readFully(data);
 
-        // Write block to disk
-        File blockFile = new File(BLOCK_DIR, encryptedBlockId);
-        try (FileOutputStream fos = new FileOutputStream(blockFile)) {
-            fos.write(data);
-        }
+    // Validate token with OAMS to get owner anonId
+    String ownerAnonId = null;
+    try (Socket oams = new Socket("localhost", 7000);
+         DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
+         DataInputStream inO = new DataInputStream(oams.getInputStream())) {
 
-        // Read optional metadata (keywords)
-        int keywordCount = in.readInt();
-        if (keywordCount > 0) {
-            List<String> keywords = new ArrayList<>();
-            for (int i = 0; i < keywordCount; i++) {
-                keywords.add(in.readUTF().toLowerCase());
-            }
-            metadata.put(encryptedBlockId, keywords);
-            saveMetadata();
-        }
-        if (token != null && !token.isEmpty()) {
-            notifyOwnerToOAMS(token, encryptedBlockId);
-        }
+        outO.writeUTF("VALIDATE_TOKEN");
+        outO.writeUTF(token == null ? "" : token);
+        outO.flush();
 
-        out.writeUTF("OK");
-        out.flush();
-    }
-
-    private static void getBlock(DataInputStream in, DataOutputStream out) throws IOException {
-        String token = in.readUTF();
-        String encryptedBlockId = in.readUTF();
-
-        boolean allowed = false;
-try (Socket oams = new Socket("localhost", 7000);
-     DataOutputStream outOAMS = new DataOutputStream(oams.getOutputStream());
-     DataInputStream inOAMS = new DataInputStream(oams.getInputStream())) {
-
-    outOAMS.writeUTF("CHECK_ACCESS");
-    outOAMS.writeUTF(token == null ? "" : token);
-    outOAMS.writeUTF(encryptedBlockId); // pass file/block anonId
-    outOAMS.flush();
-
-    String response = inOAMS.readUTF();
-    allowed = "OK_ACCESS".equals(response); // Only serve if OK_ACCESS
-} catch (Exception e) {
-    allowed = false;
-}
-
-if (!allowed) {
-    out.writeInt(-1); // deny access
-    out.flush();
-    return;
-}
-
-        File blockFile = new File(BLOCK_DIR, encryptedBlockId);
-        if (!blockFile.exists()) {
-            out.writeInt(-1);
+        String response = inO.readUTF();
+        if ("OK_VALIDATE".equals(response)) {
+            ownerAnonId = inO.readUTF();
+        } else {
+            // token invalid - reject storing
+            out.writeUTF("ERROR_INVALID_TOKEN");
             out.flush();
             return;
         }
-        byte[] data = java.nio.file.Files.readAllBytes(blockFile.toPath());
-        out.writeInt(data.length);
-        out.write(data);
+    } catch (Exception e) {
+        // couldn't reach OAMS; reject the store (fail closed)
+        out.writeUTF("ERROR_OAMS_UNAVAILABLE");
         out.flush();
+        return;
     }
+
+    // Write block to disk
+    File blockFile = new File(BLOCK_DIR, encryptedBlockId);
+    try (FileOutputStream fos = new FileOutputStream(blockFile)) {
+        fos.write(data);
+    }
+
+    // record owner mapping
+    owners.put(encryptedBlockId, ownerAnonId);
+    saveOwners();
+
+    // Read optional metadata (keywords)
+    int keywordCount = in.readInt();
+    if (keywordCount > 0) {
+        List<String> keywords = new ArrayList<>();
+        for (int i = 0; i < keywordCount; i++) {
+            keywords.add(in.readUTF().toLowerCase());
+        }
+        metadata.put(encryptedBlockId, keywords);
+        saveMetadata();
+    }
+
+    // Inform OAMS about owner (optional - creates OAMS shareRecord owner if necessary)
+    notifyOwnerToOAMS(token, encryptedBlockId);
+
+    out.writeUTF("OK");
+    out.flush();
+}
+
+    private static void getBlock(DataInputStream in, DataOutputStream out) throws IOException {
+    String token = in.readUTF();
+    String encryptedBlockId = in.readUTF();
+
+    boolean allowed = false;
+
+    // Primary check: ask OAMS for permission (OAMS now verifies signature)
+    try (Socket oams = new Socket("localhost", 7000);
+         DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
+         DataInputStream inO = new DataInputStream(oams.getInputStream())) {
+
+        outO.writeUTF("CHECK_ACCESS");
+        outO.writeUTF(token == null ? "" : token);
+        outO.writeUTF(encryptedBlockId); // pass file/block anonId
+        outO.flush();
+
+        String response = inO.readUTF();
+        allowed = "OK_ACCESS".equals(response);
+    } catch (Exception e) {
+        allowed = false;
+    }
+
+    // Secondary / defence-in-depth: check local owner mapping if OAMS was unreachable
+    if (!allowed) {
+        if (token != null && !token.isEmpty()) {
+            // extract anonId from token only if it's valid format and signature — attempt to validate with OAMS
+            // We already tried to validate with OAMS above. If OAMS was unreachable, we should not grant access.
+            // So do NOT permit access here.
+        }
+        out.writeInt(-1); // deny access
+        out.flush();
+        return;
+    }
+
+    File blockFile = new File(BLOCK_DIR, encryptedBlockId);
+    if (!blockFile.exists()) {
+        out.writeInt(-1);
+        out.flush();
+        return;
+    }
+    byte[] data = java.nio.file.Files.readAllBytes(blockFile.toPath());
+    out.writeInt(data.length);
+    out.write(data);
+    out.flush();
+}
 
     private static void listBlocks(DataOutputStream out) throws IOException {
         String[] files = new File(BLOCK_DIR).list();
@@ -184,4 +229,28 @@ if (!allowed) {
             System.err.println("Error loading metadata: " + e.getMessage());
         }
     }
+    private static void loadOwners() {
+    File f = new File(OWNERS_FILE);
+    if (!f.exists())
+        return;
+    try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
+        Map<String, String> m = (Map<String, String>) ois.readObject();
+        owners.putAll(m);
+    } catch (Exception e) {
+        System.err.println("Error loading owners: " + e.getMessage());
+    }
+}
+
+private static void saveOwners() {
+    try {
+       
+        Path tmp = Files.createTempFile("owners", ".ser");
+        try (ObjectOutputStream oos = new ObjectOutputStream(Files.newOutputStream(tmp))) {
+            oos.writeObject(new HashMap<>(owners));
+        }
+        Files.move(tmp, Paths.get(OWNERS_FILE), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    } catch (Exception e) {
+        System.err.println("Error saving owners: " + e.getMessage());
+    }
+}
 }
