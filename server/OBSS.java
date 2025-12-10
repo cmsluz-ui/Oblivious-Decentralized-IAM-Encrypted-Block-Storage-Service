@@ -9,6 +9,7 @@ public class OBSS {
 
     private static final Map<String, String> owners = new ConcurrentHashMap<>();
     private static final String OWNERS_FILE = "owners.ser";
+    // Map filename -> list of keywords
     private static Map<String, List<String>> metadata = new HashMap<>();
 
     public static void main(String[] args) throws IOException {
@@ -70,6 +71,7 @@ public class OBSS {
         byte[] data = new byte[length];
         in.readFully(data);
 
+        // Validate token with OAMS to get owner anonId
         String ownerAnonId = null;
         try (Socket oams = new Socket("localhost", 7000);
                 DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
@@ -83,11 +85,13 @@ public class OBSS {
             if ("OK_VALIDATE".equals(response)) {
                 ownerAnonId = inO.readUTF();
             } else {
+                // token invalid - reject storing
                 out.writeUTF("ERROR_INVALID_TOKEN");
                 out.flush();
                 return;
             }
         } catch (Exception e) {
+            // couldn't reach OAMS; reject the store (fail closed)
             out.writeUTF("ERROR_OAMS_UNAVAILABLE");
             out.flush();
             return;
@@ -98,6 +102,7 @@ public class OBSS {
             fos.write(data);
         }
 
+        // record owner mapping
         owners.put(encryptedBlockId, ownerAnonId);
         saveOwners();
 
@@ -111,6 +116,8 @@ public class OBSS {
             saveMetadata();
         }
 
+        // Inform OAMS about owner (optional - creates OAMS shareRecord owner if
+        // necessary)
         notifyOwnerToOAMS(token, encryptedBlockId);
 
         out.writeUTF("OK");
@@ -124,14 +131,14 @@ public class OBSS {
 
         boolean allowed = false;
 
+        // Primary check: ask OAMS for permission (OAMS now verifies signature)
         try (Socket oams = new Socket("localhost", 7000);
                 DataOutputStream outO = new DataOutputStream(oams.getOutputStream());
                 DataInputStream inO = new DataInputStream(oams.getInputStream())) {
 
             outO.writeUTF("CHECK_ACCESS");
             outO.writeUTF(token == null ? "" : token);
-            outO.writeUTF(encryptedBlockId); 
-            outO.writeUTF(recipientUsername);
+            outO.writeUTF(encryptedBlockId); // pass file/block anonId
             outO.flush();
 
             String response = inOAMS.readUTF();
@@ -227,18 +234,12 @@ public class OBSS {
 
     private static void saveOwners() {
         try {
-            Path target = Paths.get(OWNERS_FILE);
-            Path dir = target.getParent();
-            if (dir == null)
-                dir = Paths.get(".");
-
-            Path tmp = Files.createTempFile(dir, "owners_", ".tmp");
-
+            Path tmp = Files.createTempFile("owners", ".ser");
             try (ObjectOutputStream oos = new ObjectOutputStream(Files.newOutputStream(tmp))) {
                 oos.writeObject(new HashMap<>(owners));
             }
-
-            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(tmp, Paths.get(OWNERS_FILE), StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
         } catch (Exception e) {
             System.err.println("Error saving owners: " + e.getMessage());
         }
