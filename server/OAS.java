@@ -101,8 +101,6 @@ public class OAS {
         byte[] receivedHash = Base64.getDecoder().decode(in.readUTF());
         byte[] signature = Base64.getDecoder().decode(in.readUTF());
 
-        int attrCount = in.readInt();
-
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] computedHash = digest.digest(plaintext.getBytes());
 
@@ -131,17 +129,9 @@ public class OAS {
             out.flush();
             return;
         }
-
-        
-        //Load attributes
-        Map<String, String> attrs = new HashMap<>();
-        for (int i = 0; i < attrCount; i++) {
-            String key = in.readUTF();
-            String value = in.readUTF();
-            attrs.put(key, value);
-        }   
+   
         String anonId = convertId(pubKeyB64);
-        User u = new User(pubKeyB64, pwHash, salt, attrs);
+        User u = new User(pubKeyB64, pwHash, salt);
         users.put(anonId, u);
         saveUsers();
         out.writeUTF("OK_CREATE_REG");
