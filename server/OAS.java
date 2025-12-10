@@ -1,5 +1,6 @@
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.MessageDigest;
 import java.security.PublicKey;
@@ -72,30 +73,64 @@ public class OAS {
     }
 
     private static void CreateRegistration(DataInputStream in, DataOutputStream out) throws IOException {
-        try {
-            String pubKeyB64 = in.readUTF();
-            byte[] salt = Base64.getDecoder().decode(in.readUTF());
-            byte[] pwHash = Base64.getDecoder().decode(in.readUTF());
+    try {
+        
+        String plaintext = in.readUTF();        // "pubKey|salt|pwHash"
+        byte[] receivedHash = Base64.getDecoder().decode(in.readUTF());
+        byte[] signature = Base64.getDecoder().decode(in.readUTF());
 
-            int attrCount = in.readInt();
-            Map<String, String> attrs = new HashMap<>();
-            for (int i = 0; i < attrCount; i++) {
-                String key = in.readUTF();
-                String value = in.readUTF();
-                attrs.put(key, value);
-            }
+        int attrCount = in.readInt();
 
-            String anonId = convertId(pubKeyB64);
-            User u = new User(pubKeyB64, pwHash, salt, attrs);
-            users.put(anonId, u);
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] computedHash = digest.digest(plaintext.getBytes());
 
-            out.writeUTF("OK_CREATE_REG");
+        if (!MessageDigest.isEqual(receivedHash, computedHash)) {
+            out.writeUTF("ERROR_BAD_HASH");
             out.flush();
-        } catch (Exception e) {
-            out.writeUTF("ERROR_CREATE_REG");
-            out.flush();
+            return;
         }
+
+        String[] parts = plaintext.split("\\|");
+        if (parts.length != 3) {
+            out.writeUTF("ERROR_BAD_FORMAT");
+            out.flush();
+            return;
+        }
+
+        String pubKeyB64 = parts[0];
+        byte[] salt = Base64.getDecoder().decode(parts[1]);
+        byte[] pwHash = Base64.getDecoder().decode(parts[2]);
+
+        PublicKey clientPubKey = loadECPublicKey(pubKeyB64);
+
+        boolean ok = verifySignature(clientPubKey, receivedHash, signature);
+        if (!ok) {
+            out.writeUTF("ERROR_BAD_SIGNATURE");
+            out.flush();
+            return;
+        }
+
+        
+        //Load attributes
+        Map<String, String> attrs = new HashMap<>();
+        for (int i = 0; i < attrCount; i++) {
+            String key = in.readUTF();
+            String value = in.readUTF();
+            attrs.put(key, value);
+        }
+        String anonId = convertId(pubKeyB64);
+        User u = new User(pubKeyB64, pwHash, salt, attrs);
+        users.put(anonId, u);
+
+        out.writeUTF("OK_CREATE_REG");
+        out.flush();
+
+    } catch (Exception e) {
+        out.writeUTF("ERROR_CREATE_REG");
+        out.flush();
     }
+}
+
 
     private static void ModifyRegistration(DataInputStream in, DataOutputStream out) throws IOException {
         // Allows users to modify attributes previously registered by the respective
@@ -176,8 +211,8 @@ public class OAS {
 
             // verify signature
             PublicKey pubKey = loadECPublicKey(pubKeyB64);
-            String msg = nonce + "|" + timeStamp;
-            boolean check = verifySignature(pubKey, msg.getBytes(), Base64.getDecoder().decode(signatureB64));
+            String msg = nonce + "|" + timeStamp + "|" + pubKeyB64 + "|" + pwHash;
+            boolean check = verifySignature(pubKey, msg.getBytes(StandardCharsets.UTF_8), Base64.getDecoder().decode(signatureB64));
             if (!check) {
                 out.writeUTF("ERROR_BAD_SIGNATURE");
                 pendingNonces.remove(nonce);

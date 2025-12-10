@@ -22,7 +22,7 @@ public class ECCKeyManager {
         File pub = new File(PUB);
         File priv = new File(PRIV);
 
-        if (!pub.exists() || !priv.exists()) {
+        if (pub.exists() && priv.exists()) {
             return loadExistingKeyPair();
         }
 
