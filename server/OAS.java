@@ -17,13 +17,6 @@ public class OAS {
     private static final int PORT = 6000;
     private static Map<String, User> users = new HashMap<>();
     private static Map<String, String> pendingNonces = new ConcurrentHashMap<>();
-    private static final Path OAS_KEYS_DIR = Paths.get("oaskeys");
-    private static final Path OAS_PRIV_FILE = OAS_KEYS_DIR.resolve("oas_private.pkcs8");
-    private static final Path OAS_PUB_FILE = OAS_KEYS_DIR.resolve("oas_public.x509");
-    private static PrivateKey oasPrivateKey = null;
-    private static PublicKey oasPublicKey = null;
-
-    public static void main(String[] args) throws IOException {
 
     public static void main(String[] args) throws IOException {
         ServerSocket serverSocket = new ServerSocket(PORT);
@@ -42,12 +35,8 @@ public class OAS {
                 DataInputStream in = new DataInputStream(socket.getInputStream());
                 DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             while (true) {
-                String cmd;
-                try {
-                    cmd = in.readUTF();
-                } catch (Exception e) {
-                    break;
-                }
+                String cmd = in.readUTF();
+
                 switch (cmd) {
                     case "CREATE_REG":
                         CreateRegistration(in, out);
@@ -79,62 +68,73 @@ public class OAS {
             }
 
         } catch (Exception e) {
-            e.printStackTrace();
-            System.out.println("OAS client disconnected or error: " + e.getMessage());
+            System.out.println("OAS client disconnected.");
         }
     }
 
     private static void CreateRegistration(DataInputStream in, DataOutputStream out) throws IOException {
-        try {
+    try {
+        
+        String plaintext = in.readUTF();        // "pubKey|salt|pwHash"
+        byte[] receivedHash = Base64.getDecoder().decode(in.readUTF());
+        byte[] signature = Base64.getDecoder().decode(in.readUTF());
 
-            String plaintext = in.readUTF(); // "pubKey|salt|pwHash"
-            byte[] receivedHash = Base64.getDecoder().decode(in.readUTF());
-            byte[] signature = Base64.getDecoder().decode(in.readUTF());
+        int attrCount = in.readInt();
 
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] computedHash = digest.digest(plaintext.getBytes());
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] computedHash = digest.digest(plaintext.getBytes());
 
-            if (!MessageDigest.isEqual(receivedHash, computedHash)) {
-                out.writeUTF("ERROR_BAD_HASH");
-                out.flush();
-                return;
-            }
-
-            String[] parts = plaintext.split("\\|");
-            if (parts.length != 3) {
-                out.writeUTF("ERROR_BAD_FORMAT");
-                out.flush();
-                return;
-            }
-
-            String pubKeyB64 = parts[0];
-            byte[] salt = Base64.getDecoder().decode(parts[1]);
-            byte[] pwHash = Base64.getDecoder().decode(parts[2]);
-
-            PublicKey clientPubKey = loadECPublicKey(pubKeyB64);
-
-            boolean ok = verifySignature(clientPubKey, receivedHash, signature);
-            if (!ok) {
-                out.writeUTF("ERROR_BAD_SIGNATURE");
-                out.flush();
-                return;
-            }
-
-            String anonId = convertId(pubKeyB64);
-            User u = new User(pubKeyB64, pwHash, salt);
-            users.put(anonId, u);
-            saveUsers();
-            out.writeUTF("OK_CREATE_REG");
+        if (!MessageDigest.isEqual(receivedHash, computedHash)) {
+            out.writeUTF("ERROR_BAD_HASH");
             out.flush();
-
-        } catch (Exception e) {
-            out.writeUTF("ERROR_CREATE_REG");
-            out.flush();
+            return;
         }
+
+        String[] parts = plaintext.split("\\|");
+        if (parts.length != 3) {
+            out.writeUTF("ERROR_BAD_FORMAT");
+            out.flush();
+            return;
+        }
+
+        String pubKeyB64 = parts[0];
+        byte[] salt = Base64.getDecoder().decode(parts[1]);
+        byte[] pwHash = Base64.getDecoder().decode(parts[2]);
+
+        PublicKey clientPubKey = loadECPublicKey(pubKeyB64);
+
+        boolean ok = verifySignature(clientPubKey, receivedHash, signature);
+        if (!ok) {
+            out.writeUTF("ERROR_BAD_SIGNATURE");
+            out.flush();
+            return;
+        }
+
+        
+        //Load attributes
+        Map<String, String> attrs = new HashMap<>();
+        for (int i = 0; i < attrCount; i++) {
+            String key = in.readUTF();
+            String value = in.readUTF();
+            attrs.put(key, value);
+        }
+        String anonId = convertId(pubKeyB64);
+        User u = new User(pubKeyB64, pwHash, salt, attrs);
+        users.put(anonId, u);
+
+        out.writeUTF("OK_CREATE_REG");
+        out.flush();
+
+    } catch (Exception e) {
+        out.writeUTF("ERROR_CREATE_REG");
+        out.flush();
     }
+}
+
 
     private static void ModifyRegistration(DataInputStream in, DataOutputStream out) throws IOException {
-       
+        // Allows users to modify attributes previously registered by the respective
+        // user
         out.writeUTF("OK_MODIFY_REG");
         out.flush();
     }
@@ -177,6 +177,7 @@ public class OAS {
             }
 
             String storedNonce = pendingNonces.get(nonce);
+            // check if nonce exists
             if (!pendingNonces.containsKey(nonce)) {
                 out.writeUTF("ERROR_NONCE_DOES_NOT_EXIST");
                 pendingNonces.remove(nonce);
@@ -187,28 +188,31 @@ public class OAS {
             String storedAnonId = attributes[0];
             long storedTimeStamp = Long.parseLong(attributes[1]);
 
+            // check if correct nonce
             if (!storedAnonId.equals(anonId)) {
                 out.writeUTF("ERROR_BAD_NONCE");
                 pendingNonces.remove(nonce);
                 return;
             }
 
+            // check if correct timestamp
             if (storedTimeStamp != timeStamp) {
                 out.writeUTF("ERROR_BAD_TIMESTAMP");
                 pendingNonces.remove(nonce);
                 return;
             }
 
+            // check pass hash
             if (!Base64.getEncoder().encodeToString(u.pwHash).equals(pwHash)) {
                 out.writeUTF("ERROR_BAD_PASSWORD");
                 pendingNonces.remove(nonce);
                 return;
             }
 
+            // verify signature
             PublicKey pubKey = loadECPublicKey(pubKeyB64);
             String msg = nonce + "|" + timeStamp + "|" + pubKeyB64 + "|" + pwHash;
-            boolean check = verifySignature(pubKey, msg.getBytes(StandardCharsets.UTF_8),
-                    Base64.getDecoder().decode(signatureB64));
+            boolean check = verifySignature(pubKey, msg.getBytes(StandardCharsets.UTF_8), Base64.getDecoder().decode(signatureB64));
             if (!check) {
                 out.writeUTF("ERROR_BAD_SIGNATURE");
                 pendingNonces.remove(nonce);
@@ -245,52 +249,8 @@ public class OAS {
     }
 
     private static String generateToken(String anonId) {
-        try {
-            long ts = System.currentTimeMillis();
-            String payload = anonId + "|" + ts;
-            Signature signer = Signature.getInstance("SHA256withECDSA");
-            signer.initSign(oasPrivateKey);
-            signer.update(payload.getBytes(StandardCharsets.UTF_8));
-            byte[] signature = signer.sign();
-            String sigB64 = Base64.getEncoder().encodeToString(signature);
-            String tokenPlain = payload + "|" + sigB64;
-            return Base64.getEncoder().encodeToString(tokenPlain.getBytes(StandardCharsets.UTF_8));
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to generate signed token: " + e.getMessage(), e);
-        }
-    }
-
-    private static void loadOrCreateOASKeypair() throws Exception {
-        if (!Files.exists(OAS_KEYS_DIR)) {
-            Files.createDirectories(OAS_KEYS_DIR);
-        }
-
-        if (Files.exists(OAS_PRIV_FILE) && Files.exists(OAS_PUB_FILE)) {
-            byte[] privBytes = Files.readAllBytes(OAS_PRIV_FILE);
-            byte[] pubBytes = Files.readAllBytes(OAS_PUB_FILE);
-
-            KeyFactory kf = KeyFactory.getInstance("EC");
-            PKCS8EncodedKeySpec privSpec = new PKCS8EncodedKeySpec(privBytes);
-            X509EncodedKeySpec pubSpec = new X509EncodedKeySpec(pubBytes);
-
-            oasPrivateKey = kf.generatePrivate(privSpec);
-            oasPublicKey = kf.generatePublic(pubSpec);
-            System.out.println("Loaded existing OAS ECDSA keypair.");
-        } else {
-            KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
-            kpg.initialize(256);
-            KeyPair kp = kpg.generateKeyPair();
-
-            oasPrivateKey = kp.getPrivate();
-            oasPublicKey = kp.getPublic();
-            Files.write(OAS_PRIV_FILE, oasPrivateKey.getEncoded());
-            Files.write(OAS_PUB_FILE, oasPublicKey.getEncoded());
-            System.out.println("Generated and saved new OAS ECDSA keypair to " + OAS_KEYS_DIR.toString());
-        }
-    }
-
-    private static byte[] getOASPublicKeyBytes() {
-        return oasPublicKey.getEncoded();
+        long ts = System.currentTimeMillis();
+        return Base64.getEncoder().encodeToString((anonId + "|" + ts).getBytes());
     }
 
     private static void GetUserPubKey(DataInputStream in, DataOutputStream out) throws IOException {
@@ -311,25 +271,6 @@ public class OAS {
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
             throw new RuntimeException(e);
-        }
-    }
-
-    private static void loadUsers() {
-        File f = new File("users.ser");
-        if (f.exists()) {
-            try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
-                users = (Map<String, User>) ois.readObject();
-            } catch (Exception e) {
-                users = new HashMap<>();
-            }
-        }
-    }
-
-    private static void saveUsers() {
-        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream("users.ser"))) {
-            oos.writeObject(users);
-        } catch (Exception e) {
-            e.printStackTrace();
         }
     }
 }
